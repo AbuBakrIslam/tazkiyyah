@@ -288,7 +288,14 @@ input[type=range]:disabled { opacity: .4; cursor: default; }
 .kl.now .w.sung { color: var(--fg); }
 .kl.now .w.cur { color: #FFD23F; text-shadow: 0 0 24px rgba(255,210,63,.55); }
 .kara-wait { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center; padding: 24px; color: var(--fg-soft); font-weight: 600; }
-.kara-wait small { color: var(--muted); font-weight: 500; max-width: 34ch; }
+.kara-wait small { color: var(--muted); font-weight: 500; max-width: 38ch; }
+.asr-bar { width: min(300px, 80%); height: 4px; border-radius: 4px; background: rgba(255,255,255,.12); overflow: hidden; }
+.asr-bar i { display: block; height: 100%; width: 8%; background: #FFD23F; border-radius: 4px; transition: width .35s ease; }
+.asr-bar i.pulse { animation: asrPulse 1.6s ease-in-out infinite; }
+@keyframes asrPulse { 50% { opacity: .35; } }
+.add-row { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.asr-go { border-color: rgba(255,210,63,.55); color: #FFD23F; }
+.asr-note { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .kara-wait .spin { width: 26px; height: 26px; border-width: 3px; border-top-color: #FFD23F; }
 .kl .tr { display: block; margin-top: 4px; font-size: clamp(17px, 4.6vw, 22px); font-weight: 600; line-height: 1.4; color: var(--muted); }
 .kl.now .tr { color: var(--fg-soft); }
@@ -1483,7 +1490,7 @@ function renderPlayer() {
   // Vollbild-Player mit Karaoke-Songtext
   renderFullShell(t, liked);
   renderVolume(); tick();
-  if (S.full) { updateKara(true); if (S.fullMode !== "cover") maybeAutoProcess(t); }
+  if (S.full) { updateKara(true); if (S.fullMode !== "cover") maybeAutoProcess(t); if (S.asr) asrUI(); }
   if (S.playing) startKara();
 }
 function renderFull(t, liked) {
@@ -1492,7 +1499,7 @@ function renderFull(t, liked) {
   return `
     <div class="full-head">${art(coverSrc(t))}<div style="min-width:0;flex:1"><div class="t">${esc(t.title)}</div><div class="s" dir="auto">${esc(t.artist)}${t.album ? " · " + esc(t.album) : ""}</div></div>
       <button class="ibtn" data-act="close-full" aria-label="Schließen" style="width:44px;height:44px">${ico("down")}</button></div>
-    <div class="full-stage">${showLyr ? karaHTML(t) : `<div class="full-cover">${art(coverSrc(t))}</div>${lyr ? "" : `<div class="full-add"><button class="pill2" data-act="lyrics-edit" data-id="${t.id}">${ico("text")}Songtext hinzufügen</button></div>`}`}</div>
+    <div class="full-stage">${S.asr && S.asr.id === t.id ? asrHTML(t) : showLyr ? karaHTML(t) : `<div class="full-cover">${art(coverSrc(t))}</div>${lyr ? "" : `<div class="full-add"><div class="add-row"><button class="pill2 asr-go" data-act="transcribe" data-id="${t.id}">${ico("mic")}Gesang erkennen &amp; übersetzen</button><button class="pill2" data-act="lyrics-edit" data-id="${t.id}">${ico("text")}Selbst einfügen</button></div>${ls.get("asrReady", false) ? "" : `<p class="asr-note">KI läuft auf deinem Gerät · beim ersten Mal ca. 250–400 MB Download</p>`}</div>`}`}</div>
     <div class="pills">
       <button class="pill2${liked ? " on" : ""}" data-act="like" data-id="${t.id}" aria-pressed="${liked}">${ico("heart", liked ? "fill" : "")}Gefällt mir</button>
       ${lyr ? `<button class="pill2" data-act="full-mode">${ico(showLyr ? "image" : "text")}${showLyr ? "Cover" : "Songtext"}</button>` : ""}
@@ -1787,9 +1794,156 @@ async function autoSync(t) {
   S.syncing = null; renderPlayer(); if (S.panel === "lyrics") renderPanel();
 }
 function maybeAutoProcess(t) {
+  if (t && !hasLyrics(t) && !S.asr && ls.get("asrReady", false) && !asrTried.has(t.id)) { asrTried.add(t.id); setTimeout(() => transcribeTrack(t), 300); return; }
   if (!t || !hasLyrics(t) || S.syncing) return;
   if (!isSynced(t)) { if (!syncTried.has(t.id)) { syncTried.add(t.id); setTimeout(() => autoSync(t), 200); } return; }
   maybeAutoTranslate(t);
+}
+
+/* ------------------------------------------------------------ */
+/* KI-Spracherkennung (Whisper, läuft im Browser): Gesang → Text  */
+/* ------------------------------------------------------------ */
+const ASR_LIB = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1/dist/transformers.min.js";
+const ASR_MODEL = "onnx-community/whisper-small";
+S.asr = null;
+let asrWorker = null, asrTimer = 0;
+const asrTried = new Set();
+function asrWorkerCode() {
+  return `import { pipeline, env } from "${ASR_LIB}";
+env.allowLocalModels = false;
+let asr = null;
+self.onmessage = async (e) => {
+  const { audio, device, dtype } = e.data;
+  try {
+    if (!asr) asr = await pipeline("automatic-speech-recognition", "${ASR_MODEL}", { device, dtype, progress_callback: (p) => self.postMessage({ type: "progress", p }) });
+    self.postMessage({ type: "phase" });
+    const out = await asr(audio, { language: "arabic", task: "transcribe", chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
+    self.postMessage({ type: "done", out });
+  } catch (err) { self.postMessage({ type: "error", message: String((err && err.message) || err) }); }
+};`;
+}
+async function asrDevice() {
+  try {
+    const a = navigator.gpu && await navigator.gpu.requestAdapter();
+    if (a) return { device: "webgpu", dtype: { encoder_model: a.features.has("shader-f16") ? "fp16" : "fp32", decoder_model_merged: "q4" } };
+  } catch { /* weiter ohne GPU */ }
+  return { device: "wasm", dtype: { encoder_model: "q8", decoder_model_merged: "q8" } };
+}
+async function decode16k(blob) {
+  const buf = await blob.arrayBuffer();
+  const AC = window.AudioContext || window.webkitAudioContext; const ac = new AC();
+  let d;
+  try { d = await new Promise((res, rej) => { const pr = ac.decodeAudioData(buf, res, rej); if (pr && pr.then) pr.then(res, rej); }); }
+  finally { try { ac.close(); } catch { /* egal */ } }
+  const SR = 16000, OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const oc = new OAC(1, Math.max(1, Math.ceil(d.duration * SR)), SR);
+  const src = oc.createBufferSource(); src.buffer = d; src.connect(oc.destination); src.start(0);
+  const r = await new Promise((res, rej) => { oc.oncomplete = (e) => res(e.renderedBuffer); const pr = oc.startRendering(); if (pr && pr.then) pr.then(res, rej); });
+  return { pcm: new Float32Array(r.getChannelData(0)), duration: d.duration };
+}
+function asrRun(pcm, cfg) {
+  return new Promise((res, rej) => {
+    if (!asrWorker) asrWorker = new Worker(URL.createObjectURL(new Blob([asrWorkerCode()], { type: "text/javascript" })), { type: "module" });
+    const files = {};
+    asrWorker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === "progress") {
+        const pg = m.p || {};
+        if (pg.status === "progress" && pg.file) {
+          files[pg.file] = [pg.loaded || 0, pg.total || 0];
+          let L = 0, T = 0; for (const [l, tt] of Object.values(files)) { L += l; T += tt; }
+          if (S.asr) { S.asr.phase = "download"; S.asr.pct = T ? L / T : 0; S.asr.mb = T / 1048576; asrUI(); }
+        }
+      } else if (m.type === "phase") { if (S.asr) { S.asr.phase = "transcribe"; S.asr.t0 = Date.now(); asrUI(); } }
+      else if (m.type === "done") res(m.out);
+      else if (m.type === "error") rej(new Error(m.message));
+    };
+    asrWorker.onerror = (e) => rej(new Error((e && e.message) || "Worker-Fehler"));
+    asrWorker.postMessage({ audio: pcm, device: cfg.device, dtype: cfg.dtype }, [pcm.buffer]);
+  });
+}
+/* Whisper-Abschnitte → kurze Karaoke-Zeilen mit Wortzeiten */
+function asrToLines(out, duration) {
+  const chunks = (out && Array.isArray(out.chunks) && out.chunks.length) ? out.chunks : [{ timestamp: [0, duration], text: (out && out.text) || "" }];
+  const lines = []; let prevEnd = 0;
+  const wt = (w) => Math.max(1, w.replace(/[ً-ٰٟـ]/g, "").length);
+  for (const c of chunks) {
+    const text = String(c.text || "").replace(/[\[\(（].*?[\]\)）]/g, " ").replace(/\s+/g, " ").trim();
+    const ts = c.timestamp || [];
+    let start = Number.isFinite(ts[0]) ? ts[0] : prevEnd;
+    let end = Number.isFinite(ts[1]) ? ts[1] : Math.min(duration || start + 4, start + 4);
+    if (end <= start) end = start + 1.5;
+    prevEnd = end;
+    const words = splitWords(text);
+    if (!words.length || !AR.test(text)) continue;
+    if (lines.length && lines[lines.length - 1].text === words.join(" ") && start - lines[lines.length - 1].end < 0.5) continue; // Wiederholungs-Echo
+    const n = Math.max(1, Math.ceil(words.length / 6)), size = Math.ceil(words.length / n);
+    const total = words.reduce((a, w) => a + wt(w), 0); let acc = 0;
+    for (let i = 0; i < words.length; i += size) {
+      const part = words.slice(i, i + size);
+      const pw = part.reduce((a, w) => a + wt(w), 0);
+      const ls0 = start + (end - start) * acc / total, le = start + (end - start) * (acc + pw) / total;
+      let a2 = 0;
+      const ws = part.map((w) => { const tt = ls0 + (le - ls0) * 0.94 * a2 / pw; a2 += wt(w); return { t: +tt.toFixed(2), w }; });
+      lines.push({ time: +ls0.toFixed(2), text: part.join(" "), words: ws, end: le });
+      acc += pw;
+    }
+  }
+  for (let i = 1; i < lines.length; i++) if (lines[i].time <= lines[i - 1].time) lines[i].time = +(lines[i - 1].time + 0.2).toFixed(2);
+  return lines.map(({ end, ...l }) => l);
+}
+function asrMsg() {
+  const a = S.asr; if (!a) return "";
+  if (a.phase === "download") return `KI-Modell wird geladen … ${Math.round((a.pct || 0) * 100)} %` + (a.mb ? ` (einmalig, ca. ${Math.round(a.mb)} MB)` : "");
+  if (a.phase === "transcribe") return `Gesang wird erkannt … ${Math.round((Date.now() - (a.t0 || Date.now())) / 1000)} s`;
+  if (a.phase === "translate") return "Wird ins Deutsche übersetzt …";
+  return "Audio wird vorbereitet …";
+}
+function asrHTML(t) {
+  return `<div class="kara-wait" data-asr="${t.id}"><span class="spin"></span><span class="asr-msg">${esc(asrMsg())}</span><div class="asr-bar"><i></i></div><small>Läuft komplett auf deinem Gerät: Der arabische Gesang wird mitgeschrieben, in Abschnitte geteilt und danach übersetzt. Ein Nasheed dauert etwa so lange wie seine Spielzeit oder kürzer.</small></div>`;
+}
+function asrUI() {
+  const el = document.querySelector("[data-asr]");
+  if (!S.asr || !el || el.dataset.asr !== S.asr.id) { renderPlayer(); if (S.panel === "lyrics") renderPanel(); return; }
+  document.querySelectorAll("[data-asr]").forEach((box) => {
+    box.querySelector(".asr-msg").textContent = asrMsg();
+    const bar = box.querySelector(".asr-bar i");
+    bar.style.width = S.asr.phase === "download" ? Math.round((S.asr.pct || 0) * 100) + "%" : S.asr.phase === "transcribe" ? "100%" : "8%";
+    bar.classList.toggle("pulse", S.asr.phase === "transcribe");
+  });
+}
+async function transcribeTrack(t) {
+  if (!t || S.asr) return;
+  asrTried.add(t.id);
+  S.asr = { id: t.id, phase: "prepare", pct: 0 }; S.fullMode = "lyrics";
+  renderPlayer(); if (S.panel === "lyrics") renderPanel();
+  clearInterval(asrTimer); asrTimer = setInterval(() => { if (S.asr && S.asr.phase === "transcribe") asrUI(); }, 1000);
+  try {
+    const { pcm, duration } = await decode16k(await audioBlobFor(t));
+    let cfg = await asrDevice(), out;
+    try { out = await asrRun(pcm.slice(), cfg); }
+    catch (e) {
+      if (cfg.device !== "webgpu") throw e;
+      try { asrWorker.terminate(); } catch { /* egal */ } asrWorker = null;
+      cfg = { device: "wasm", dtype: { encoder_model: "q8", decoder_model_merged: "q8" } };
+      S.asr.phase = "prepare"; asrUI();
+      out = await asrRun(pcm.slice(), cfg);
+    }
+    const lines = asrToLines(out, duration);
+    if (!lines.length) throw new Error("Kein arabischer Gesang erkannt.");
+    ls.set("asrReady", true);
+    t.lyrics = lines; if (!t.duration) t.duration = duration;
+    S.asr.phase = "translate"; asrUI();
+    if (canEdit(t)) await cloudSaveLyrics(t);
+    S.asr = null; syncTried.add(t.id); autoTried.delete(t.id);
+    renderPlayer(); if (S.panel === "lyrics") renderPanel();
+    await translateTrack(t, true);
+    toast(canEdit(t) ? "Gesang erkannt, übersetzt und gespeichert" : "Gesang erkannt – nur für dich sichtbar");
+  } catch (e) {
+    toast("Erkennen hat nicht geklappt: " + String((e && e.message) || e).slice(0, 100));
+  }
+  clearInterval(asrTimer); S.asr = null;
+  renderPlayer(); if (S.panel === "lyrics") renderPanel();
 }
 
 const autoTried = new Set();
@@ -1854,7 +2008,7 @@ function renderPanel() {
     const lyr = hasLyrics(t);
     p.innerHTML = `<div class="panel-head"><div style="min-width:0"><h3>Songtext</h3>${t ? `<p>${esc(t.title)} · ${esc(t.artist)}</p>` : ""}</div>
       <div style="display:flex">${t && lyr ? trButton(t, true) + `<button class="ibtn" data-act="lyrics-edit" data-id="${t.id}" aria-label="Songtext bearbeiten">${ico("edit")}</button>` : ""}<button class="ibtn" data-act="panel" data-p="lyrics" aria-label="Schließen">${ico("x")}</button></div></div>
-      ${lyr ? karaHTML(t) : `<div style="padding:12px 18px"><p class="muted" style="margin:0 0 14px">Für dieses Nasheed gibt es noch keinen Songtext.</p>${t ? `<button class="pill solid" data-act="lyrics-edit" data-id="${t.id}">${ico("text")}Songtext hinzufügen</button>` : ""}</div>`}`;
+      ${t && S.asr && S.asr.id === t.id ? asrHTML(t) : lyr ? karaHTML(t) : `<div style="padding:12px 18px"><p class="muted" style="margin:0 0 14px">Für dieses Nasheed gibt es noch keinen Songtext.</p>${t ? `<div class="add-row" style="justify-content:flex-start"><button class="pill solid" data-act="transcribe" data-id="${t.id}">${ico("mic")}Gesang erkennen &amp; übersetzen</button><button class="pill ghost" data-act="lyrics-edit" data-id="${t.id}">${ico("text")}Selbst einfügen</button></div>` : ""}</div>`}`;
     updateKara(true); if (S.playing) startKara(); maybeAutoProcess(t);
     return;
   }
@@ -1979,6 +2133,7 @@ function renderModal() {
         <button class="opt" data-act="go" data-view="artist" data-id="${esc(t.artist)}">${ico("music")}Zum Künstler</button>
         ${inPl && m.pos != null ? `<button class="opt" data-act="pl-remove" data-pos="${m.pos}">${ico("x")}Aus dieser Playlist entfernen</button>` : ""}
         ${canEdit(t) ? `<button class="opt" data-act="lyrics-edit" data-id="${t.id}">${ico("text")}${hasLyrics(t) ? "Songtext bearbeiten" : "Songtext hinzufügen"}</button>` : ""}
+        <button class="opt" data-act="m-asr">${ico("mic")}${hasLyrics(t) ? "Gesang neu erkennen (KI)" : "Gesang erkennen & übersetzen (KI)"}</button>
         ${cloud.isAdmin ? `<button class="opt" data-act="m-public">${ico("music")}${t.isPublic ? "Nicht mehr öffentlich" : "Für alle veröffentlichen"}</button>` : ""}
         ${canEdit(t) ? `<button class="opt danger" data-act="m-delete">${ico("trash")}Löschen</button>` : ""}`;
     }
@@ -2085,6 +2240,8 @@ document.addEventListener("click", async (e) => {
     case "tr-toggle": S.showTr = !S.showTr; ls.set("showTr", S.showTr); renderPlayer(); if (S.panel === "lyrics") renderPanel(); break;
     case "translate": translateTrack(current()); break;
     case "lyrics-edit": openLyricsEditor(el.dataset.id || current()?.id); break;
+    case "transcribe": transcribeTrack(S.byId.get(el.dataset.id) || current()); break;
+    case "m-asr": { const t = S.byId.get(m.id); closeModal(); if (!t) break; if (current()?.id !== t.id) playList([t.id], 0); S.full = true; S.panel = null; renderPlayer(); renderPanel(); transcribeTrack(t); break; }
     case "lyrics-next": lyricsNext(); break;
     case "lyrics-save-static": lyricsStatic(); break;
     case "sync-tap": syncTap(); break;
